@@ -7,7 +7,7 @@ import time
 import warnings
 from io import StringIO
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Callable
 
 import gradio as gr
 import nest_asyncio
@@ -15,21 +15,21 @@ import openvino.properties as props
 import openvino.properties.hint as hints
 import openvino.properties.streams as streams
 import requests
+import yaml
 from llama_index.core import PromptTemplate
 from llama_index.core import SimpleDirectoryReader
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.agent import ReActAgent
-from llama_index.core.agent import ReActChatFormatter
-from llama_index.core.callbacks import CallbackManager
-from llama_index.core.llms import MessageRole
 from llama_index.core.tools import FunctionTool
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.embeddings.huggingface_openvino import OpenVINOEmbedding
-from llama_index.llms.openvino_genai import OpenVINOGenAILLM
-
-from system_prompt import react_system_header_str
+from llama_index.llms.openvino import OpenVINOLLM
+from llama_index.core.agent import ReActChatFormatter
+from llama_index.core.llms import MessageRole
+from llama_index.core.callbacks import CallbackManager
 # Agent tools
-from tools import PaintCalculator, ShoppingCart
+from tools import PaintCalculator, ShoppingCart, RestaurantBooker
+from system_prompt import react_system_header_str
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
@@ -47,7 +47,7 @@ ov_config = {
 def setup_models(
     llm_model_path: Path,
     embedding_model_path: Path,
-    device: str) -> Tuple[OpenVINOGenAILLM, OpenVINOEmbedding]:
+    device: str) -> Tuple[OpenVINOLLM, OpenVINOEmbedding]:
     """
     Sets up LLM and embedding models using OpenVINO.
     
@@ -70,18 +70,14 @@ def setup_models(
         sys.exit(1)
 
     # Load LLM model locally    
-    llm = OpenVINOGenAILLM(
-        model_path=str(llm_model_path),
-        config=ov_config,
-        device=device
+    llm = OpenVINOLLM(
+        model_id_or_path=str(llm_model_path),
+        context_window=8192,
+        max_new_tokens=500,
+        model_kwargs={"ov_config": ov_config},
+        generate_kwargs={"do_sample": False, "temperature": 0.1, "top_p": 0.8},        
+        device_map=device,
     )
-    # change number of tokens to be generated in one step
-    llm._streamer.tokens_len = 1
-
-    llm.config.max_new_tokens = 500
-    llm.config.do_sample = False
-    llm.config.temperature = 0.1
-    llm.config.top_p = 0.8
 
     # Load the embedding model locally
     embedding = OpenVINOEmbedding(model_id_or_path=str(embedding_model_path), device=device)
@@ -98,7 +94,11 @@ def setup_tools()-> Tuple[FunctionTool, FunctionTool, FunctionTool, FunctionTool
         Tuple containing tools for paint cost calculation, paint gallons calculation, 
         adding items to cart, viewing cart, and clearing cart
     """
-
+    booker = FunctionTool.from_defaults(
+        fn = RestaurantBooker.bookbyurl,
+        name = "booktherestaurantbyurl",
+        description="ALWAYS use this tool when booking issue. Make sure to pass the FULL URL string that starts with 'https://inline.app/booking/' please return the url contains 'https://inline.app/booking/'"
+    )
     paint_cost_calculator = FunctionTool.from_defaults(
         fn=PaintCalculator.calculate_paint_cost,
         name="calculate_paint_cost",
@@ -115,18 +115,14 @@ def setup_tools()-> Tuple[FunctionTool, FunctionTool, FunctionTool, FunctionTool
         fn=ShoppingCart.add_to_cart,
         name="add_to_cart",
         description="""
-        Use this tool WHENEVER a user wants to add any item to their cart or shopping cart.
+        Use this tool WHENEVER a user wants to Note for me.
         
         PARAMETERS:
-        - product_name (string): The exact name of the product (e.g., "Premium Latex Paint")
-        - quantity (int): The number of units to add, must be a positive integer (e.g., 2)
-        - price_per_unit (float): The price per unit in dollars (e.g., 24.99)
+        - store name (string): The restaurant name
+        - phone num (float): The phone of the restaurant
         
         RETURNS:
-        - A confirmation message and updated cart contents
-        
-        EXAMPLES:
-        To add 3 gallons of paint at $29.99 each: add_to_cart(product_name="Interior Eggshell Paint", quantity=3, price_per_unit=29.99)
+        - A confirmation message and updated Notes contents
         """
     )
     
@@ -159,7 +155,7 @@ def setup_tools()-> Tuple[FunctionTool, FunctionTool, FunctionTool, FunctionTool
         To empty the shopping cart: clear_cart()
         """
     )
-    return paint_cost_calculator, add_to_cart_tool, get_cart_items_tool, clear_cart_tool, paint_gallons_calculator
+    return paint_cost_calculator, add_to_cart_tool, get_cart_items_tool, clear_cart_tool, paint_gallons_calculator, booker
 
 
 def load_documents(text_example_en_path: Path) -> VectorStoreIndex:
@@ -174,7 +170,7 @@ def load_documents(text_example_en_path: Path) -> VectorStoreIndex:
     """
     
     if not text_example_en_path.exists():
-        text_example_en = "test_painting_llm_rag.pdf"
+        text_example_en = "restaurant.pdf"
         r = requests.get(text_example_en)
         content = io.BytesIO(r.content)
         with open(text_example_en_path, "wb") as f:
@@ -241,33 +237,30 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
         """
         cart_items = ShoppingCart.get_cart_items()
         if not cart_items:
-            return "### 🛒 Your Shopping Cart is Empty"
+            return "### 📄 Your Resevation Note is Empty"
             
-        table = "### 🛒 Your Shopping Cart\n\n"
+        table = "### 📄 Your Reservation\n\n"
         table += "<table>\n"
         table += "  <thead>\n"
         table += "    <tr>\n"
-        table += "      <th>Product</th>\n"
-        table += "      <th>Qty</th>\n"
-        table += "      <th>Price</th>\n"
-        table += "      <th>Total</th>\n"
+        table += "      <th>store</th>\n"
+        table += "      <th>time</th>\n"
+        table += "      <th>phonenumber</th>\n"
         table += "    </tr>\n"
         table += "  </thead>\n"
         table += "  <tbody>\n"
             
         for item in cart_items:
             table += "    <tr>\n"
-            table += f"      <td>{item['product_name']}</td>\n"
-            table += f"      <td>{item['quantity']}</td>\n"
-            table += f"      <td>${item['price_per_unit']:.2f}</td>\n"
-            table += f"      <td>${item['total_price']:.2f}</td>\n"
+            table += f"      <td>{item['store_name']}</td>\n"
+            table += f"      <td>{item['time']}</td>\n"
+            table += f"      <td>{item['phonenumber']}</td>\n"
             table += "    </tr>\n"
             
         table += "  </tbody>\n"
         table += "</table>\n"
         
-        total = sum(item["total_price"] for item in cart_items)
-        table += f"\n**Total: ${total:.2f}**"
+
         return table
 
     def _generate_response(chat_history: list, log_history: list | None = None)->Tuple[str,str,str]:
@@ -306,13 +299,15 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
             except ValueError:
                 response = agent.stream_chat(chat_history[-1][0])
         formatted_output = []
+        action_input = ""
         for line in output:
             if "Thought:" in line:
-                formatted_output.append("\n🤔 **Thought:**\n" + line.split("Thought:", 1)[1])
+                formatted_output.append("\n **Thought:**\n" + line.split("Thought:", 1)[1])
             elif "Action:" in line:
                 formatted_output.append("\n🔧 **Action:**\n" + line.split("Action:", 1)[1])
             elif "Action Input:" in line:
                 formatted_output.append("\n📥 **Input:**\n" + line.split("Action Input:", 1)[1])
+                action_input = line.split("Action Input:", 1)[1]
             elif "Observation:" in line:
                 formatted_output.append("\n📋 **Result:**\n" + line.split("Observation:", 1)[1])
             else:
@@ -322,7 +317,7 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
 
         # After response is complete, show the captured logs in the log area
         log_entries = "\n".join(formatted_output)
-        log_history.append("### 🤔 Agent's Thought Process")
+        log_history.append("###  Agent's Thought Process")
         thought_process_log = f"Thought Process Time: {thought_process_time:.2f} seconds"
         log_history.append(f"{log_entries}\n{thought_process_log}")
         cart_content = update_cart_display() # update shopping cart
@@ -357,7 +352,10 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
 
         # Append the response time to log history
         log_history.append(response_log)
-        yield chat_history, "\n".join(log_history), cart_content  # Join logs into a string for display
+        yield chat_history, "\n".join(log_history), cart_content
+
+    
+
 
     def _reset_chat()-> tuple[str, list, str, str]:
         """
@@ -377,7 +375,7 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
         """
         agent.reset()
         ShoppingCart._cart_items = []
-        return "", [], "🤔 Agent's Thought Process", update_cart_display()
+        return "", [], " Agent's Thought Process", update_cart_display()
 
     def run()-> None:
         """
@@ -406,10 +404,12 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
         except Exception as e:            
             log.warning(f"Could not load CSS file: {e}")
 
-        theme = gr.themes.Default(
-            primary_hue="blue",
-            font=[gr.themes.GoogleFont("Montserrat"), "ui-sans-serif", "sans-serif"],
-        )
+        
+        # theme = gr.themes.Default(
+        #     primary_hue="blue",
+        #     font=[gr.themes.GoogleFont("Montserrat"), "ui-sans-serif", "sans-serif"],
+        # )
+        theme = gr.themes.Monochrome()
 
         with gr.Blocks(theme=theme, css=custom_css) as demo:
 
@@ -417,22 +417,22 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
                         "<div class='intel-header-wrapper'>"
                         "  <div class='intel-header'>"
                         "    <img src='https://www.intel.com/content/dam/logos/intel-header-logo.svg' class='intel-logo'></img>"
-                        "    <div class='intel-title'>Smart Retail Assistant 🤖: Agentic LLMs with RAG 💭</div>"
+                        "    <div class='intel-title'>BOOK 4 ME : Restaurant LLM with RAG </div>"
                         "  </div>"
                         "</div>"
             )
 
             with gr.Row():
                 chat_window = gr.Chatbot(
-                    label="Paint Purchase Helper",
+                    label="Restaurant Booking Assistant",
                     avatar_images=(None, "https://docs.openvino.ai/2024/_static/favicon.ico"),
                     height=400,  # Adjust height as per your preference
-                    scale=2  # Set a higher scale value for Chatbot to make it wider
-                    #autoscroll=True,  # Enable auto-scrolling for better UX
+                    scale=2,  # Set a higher scale value for Chatbot to make it wider
+                    autoscroll=True,  # Enable auto-scrolling for better UX
                 )            
                 log_window = gr.Markdown(                                                                    
                         show_label=True,                        
-                        value="### 🤔 Agent's Thought Process",
+                        value="###  Agent's Thought Process",
                         height=400,                        
                         elem_id="agent-steps"
                 )
@@ -443,23 +443,17 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
                 )
 
             with gr.Row():
-                message = gr.Textbox(label="Ask the Paint Expert 🎨", scale=4, placeholder="Type your prompt/Question and press Enter")
+                message = gr.Textbox(label="Ask about restaurants 🍴", placeholder="Find me a restaurant in 南港",scale=4)
 
                 with gr.Column(scale=1):
                     submit_btn = gr.Button("Submit", variant="primary")
                     clear = gr.ClearButton()
                           
             sample_questions = [
-                "what paint is the best for kitchens?",
-                "what is the price of it?",
-                "how many gallons of paint do I need to cover 600 sq ft ?",
-                "add them to my cart",
-                "what else do I need to complete my project?",
-                "add 2 brushes to my cart",
-                "create a table with paint products sorted by price",
-                "Show me what's in my cart",
-                "clear shopping cart",
-                "I have a room 1000 sqft, I'm looking for supplies to paint the room"              
+                "Tell me some restaurant nearby 南港",
+                "I want to have a dinner in 內湖",
+                "BOOK FOR ME",
+                "NOTE FOR ME"
             ]
             gr.Examples(
                 examples=sample_questions,
@@ -491,9 +485,9 @@ def run_app(agent: ReActAgent, public_interface: bool = False) -> None:
             )
             clear.click(_reset_chat, None, [message, chat_window, log_window, cart_display])
 
-            gr.Markdown("------------------------------")
+            gr.Markdown("------------------------------")            
 
-        print("Demo is ready!", flush=True)  # Required for the CI to detect readiness
+        print("Demo is ready!")
         demo.queue().launch(share=public_interface)
 
     run()
@@ -517,7 +511,7 @@ def run(chat_model: Path, embedding_model: Path, rag_pdf: Path, device: str, pub
     Settings.llm = llm
 
     # Set up tools
-    paint_cost_calculator, add_to_cart_tool, get_cart_items_tool, clear_cart_tool, paint_gallons_calculator = setup_tools()
+    paint_cost_calculator, add_to_cart_tool, get_cart_items_tool, clear_cart_tool, paint_gallons_calculator, booker = setup_tools()
     
     text_example_en_path = Path(rag_pdf)
     index = load_documents(text_example_en_path)
@@ -528,18 +522,17 @@ def run(chat_model: Path, embedding_model: Path, rag_pdf: Path, device: str, pub
         metadata=ToolMetadata(
             name="vector_search",
             description="""            
-            Use this tool for ANY question about paint products, recommendations, prices, or technical specifications.
+            Use this tool for ANY question about restaurant, recommendations, and the phone number but except booking.
             
             WHEN TO USE:
-            - User asks about paint types, brands, or products
-            - User needs price information before adding to cart
-            - User needs recommendations based on their project
-            - User has technical questions about painting
+            - User asks about restaurant in 南港,士林,中正,中山
+            - User needs phone number 
+            - User needs URL of the restaurant
             
             EXAMPLES:
-            - "What paint is best for kitchen cabinets?"
-            - "How much does AwesomePainter Interior Acrylic Latex cost?"
-            - "What supplies do I need for painting my living room?"
+            - "I want to eat in 中山?"
+            - "Please give me the url"
+            - "I want to have a dinner in 士林"
             """,
         ),
     )
@@ -548,7 +541,7 @@ def run(chat_model: Path, embedding_model: Path, rag_pdf: Path, device: str, pub
  
     # Define agent and available tools
     agent = ReActAgent.from_tools(
-        [paint_cost_calculator, add_to_cart_tool, get_cart_items_tool, clear_cart_tool, vector_tool, paint_gallons_calculator],
+        [paint_cost_calculator, add_to_cart_tool, get_cart_items_tool, clear_cart_tool, vector_tool, paint_gallons_calculator,booker],
         llm=llm,
         max_iterations=5,  # Set a max_iterations value
         handle_reasoning_failure_fn=custom_handle_reasoning_failure,
@@ -562,13 +555,12 @@ def run(chat_model: Path, embedding_model: Path, rag_pdf: Path, device: str, pub
     agent.reset()                     
     run_app(agent, public_interface)
 
-
 if __name__ == "__main__":
     # Define the argument parser at the end
     parser = argparse.ArgumentParser()
     parser.add_argument("--chat_model", type=str, default="model/qwen2-7B-INT4", help="Path to the chat model directory")
     parser.add_argument("--embedding_model", type=str, default="model/bge-large-FP32", help="Path to the embedding model directory")
-    parser.add_argument("--rag_pdf", type=str, default="data/test_painting_llm_rag.pdf", help="Path to a RAG PDF file with additional knowledge the chatbot can rely on.")    
+    parser.add_argument("--rag_pdf", type=str, default="data\\restaurant.pdf", help="Path to a RAG PDF file with additional knowledge the chatbot can rely on.")    
     parser.add_argument("--device", type=str, default="AUTO:GPU,CPU", help="Device for inferencing (CPU,GPU,GPU.1,NPU)")
     parser.add_argument("--public", default=False, action="store_true", help="Whether interface should be available publicly")
 

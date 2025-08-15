@@ -84,7 +84,7 @@ body {
 .intel-header {
     margin: 0px;
     padding: 0 15px;
-    background: #0054ae;
+    background: black;
     height: 60px;
     width: 100%;
     display: flex;

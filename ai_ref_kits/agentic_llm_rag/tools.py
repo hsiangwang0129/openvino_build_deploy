@@ -1,4 +1,57 @@
 import math
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from time import sleep
+from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import os.path
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+
+
+
+
+class RestaurantBooker:
+
+    @staticmethod
+    def bookbyurl(url: str) -> str:
+        """
+        Book the restaurant through URL
+        
+        Args:
+            url: the url contains "https://inline.app/booking/"
+            
+        Returns:
+            the url
+        """
+        if not url.startswith("https://inline.app/booking/"):
+            url = "https://inline.app/booking/" + url.lstrip("/")
+        options = webdriver.ChromeOptions()
+        options.add_experimental_option("detach",True)
+        driver = webdriver.Chrome(options = options,service=Service(ChromeDriverManager().install()))
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd(
+            "Network.setExtraHTTPHeaders",
+            {"headers": {
+                "User-Agent": "Mozilla/5.0 ...",
+                "Referer": "https://inline.app/"
+            }}
+        )
+        driver.get("https://inline.app/booking/-OOuuRwnTgKRpg9MGo5J:inline-live-3/-OOuuS3WRVzDkx9z1xEW")
+        sleep(15)
+        driver.close()
+        return f"Sucessfully book the restaurant through {url}"
+    
+
+
+
+
 
 class PaintCalculator:
 
@@ -36,12 +89,15 @@ class PaintCalculator:
         gallons_needed = math.ceil((area / 400) * 2)
         return gallons_needed
 
+
+
+
 class ShoppingCart:
     # In-memory shopping cart
     _cart_items = []
     
     @staticmethod
-    def add_to_cart(product_name: str, quantity: int, price_per_unit: float) -> dict:
+    def add_to_cart(store_name: str,phone:str) -> dict:
         """
         Add an item to the shopping cart.
         Add a product to a user's shopping cart.
@@ -55,29 +111,86 @@ class ShoppingCart:
         Returns:
             Dict with confirmation message and current cart items
         """
+        now = datetime.now() + timedelta(hours=2)
+        minute = now.minute
+
+        
+        if minute < 15:
+            rounded_minute = 0
+        elif minute < 45:
+            rounded_minute = 30
+        else:
+            now += timedelta(hours=1)
+            rounded_minute = 0
+
+        
+        time = now.replace(minute=rounded_minute, second=0, microsecond=0).strftime("%H:%M")
+
         item = {
-            "product_name": product_name,
-            "quantity": quantity,
-            "price_per_unit": price_per_unit,
-            "total_price": round(quantity * price_per_unit, 2)
+            "store_name": store_name,
+            "time": time,
+            "phonenumber": phone,
         }
         
-        # Check if item already exists
-        for existing_item in ShoppingCart._cart_items:
-            if existing_item["product_name"] == product_name:
-                # Update quantity
-                existing_item["quantity"] += quantity
-                existing_item["total_price"] = round(existing_item["quantity"] * existing_item["price_per_unit"], 2)
-                return {
-                    "message": f"Updated {product_name} quantity to {existing_item['quantity']} in your cart",
-                    "cart": ShoppingCart._cart_items
-                }
         
-        # Add new item
         ShoppingCart._cart_items.append(item)
-        
+        SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+        creds = None
+        if os.path.exists("token.json"):
+            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    "credentials.json", SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+            with open("token.json", "w") as token:
+                token.write(creds.to_json())
+
+        try:
+            service = build("calendar", "v3", credentials=creds)
+
+            # Current time in UTC+8 (Asia/Taipei)
+            now = datetime.now(timezone.utc) + timedelta(hours=8)
+
+            minute = now.minute
+            if minute < 15:
+                rounded_minute = 0
+            elif minute < 45:
+                rounded_minute = 30
+            else:
+                now += timedelta(hours=1)
+                rounded_minute = 0
+
+            start_time = now.replace(minute=rounded_minute, second=0, microsecond=0)
+            end_time = start_time + timedelta(hours=2)
+
+            event = {
+                "summary": "PRESERVE ORDER REMINDER",
+                "location": "131 Trade Road, Section 2, Banqiao District, Taipei City",
+                "description": "Phone: 0227863757",
+                "colorId": "6",
+                "start": {
+                    "dateTime": start_time.isoformat(),
+                    "timeZone": "Asia/Taipei",
+                },
+                "end": {
+                    "dateTime": end_time.isoformat(),
+                    "timeZone": "Asia/Taipei",
+                },
+            }
+
+            created_event = service.events().insert(calendarId="primary", body=event).execute()
+            
+
+        except HttpError as error:
+            print(f"An error occurred: {error}")
+
         return {
-            "message": f"Added {quantity} {product_name} to your cart",
+            "message": f"Added {store_name} to your Callender Link:{created_event.get('htmlLink')}",
             "cart": ShoppingCart._cart_items
         }
     

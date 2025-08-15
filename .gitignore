@@ -117,3 +117,5 @@ pipcache_openvino/
 demos/*/node_modules/**
 **/kernel.errors.txt
 .DS_Store
+ai_ref_kits/agentic_llm_rag/token.json
+ai_ref_kits/agentic_llm_rag/credentials.json
